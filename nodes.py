@@ -282,12 +282,40 @@ except Exception as _e:  # noqa: BLE001
                    "(preview will use comfy's calculate_sigmas only).", _e)
 
 
+def _res4lyf_special_sigmas(scheduler: str, model_sampling,
+                            steps: int, denoise: float = 1.0):
+    """Compute sigmas for RES4LYF schedulers that are *not* registered in
+    ``comfy.samplers.SCHEDULER_HANDLERS``.
+
+    RES4LYF lists ``beta57`` in its custom dropdown (and uses it as the
+    default for many of its nodes) but never registers a handler -- it
+    short-circuits inside its own ``get_sigmas`` to
+    ``beta_scheduler(model_sampling, steps, alpha=0.5, beta=0.7)``.
+    Calling ``calculate_sigmas`` for ``beta57`` therefore raises, which
+    is what made our preview drop to a linear-ramp stub.
+
+    Returns a sigmas tensor (with denoise crop applied like
+    BasicScheduler does) or ``None`` if *scheduler* is not a special.
+    """
+    if scheduler != "beta57":
+        return None
+    beta_fn = getattr(comfy_samplers, "beta_scheduler", None)
+    if beta_fn is None:
+        return None
+    if denoise >= 1.0 or denoise <= 0.0:
+        return beta_fn(model_sampling, steps, alpha=0.5, beta=0.7)
+    total_steps = int(steps / max(denoise, 1e-4))
+    sigmas = beta_fn(model_sampling, total_steps, alpha=0.5, beta=0.7)
+    return sigmas[-(steps + 1):]
+
+
 def _compute_scheduler_sigmas(model_sampling, scheduler: str, steps: int):
     """Get a sigmas list for *scheduler* + *steps*.
 
     Tries the cached RES4SHO ``_SCHEDULERS`` dict first so our schedulers
     work regardless of whether comfy's ``SCHEDULER_HANDLERS`` picked them
-    up. Falls back to comfy's ``calculate_sigmas`` otherwise.
+    up. Then handles RES4LYF specials (``beta57``). Falls back to comfy's
+    ``calculate_sigmas`` otherwise.
 
     Returns ``(sigmas_list, dispatch_label)`` -- a tuple so the endpoint
     can surface which path was used. ``sigmas_list`` is ``None`` only when
@@ -304,6 +332,15 @@ def _compute_scheduler_sigmas(model_sampling, scheduler: str, steps: int):
                 "SigmaCurves: RES4SHO scheduler '%s' raised: %s",
                 scheduler, e)
             return None, f"res4sho_error: {e!r}"
+
+    try:
+        special = _res4lyf_special_sigmas(scheduler, model_sampling, steps)
+        if special is not None:
+            return special.cpu().tolist(), "res4lyf_special"
+    except Exception as e:  # noqa: BLE001
+        LOGGER.warning(
+            "SigmaCurves: RES4LYF special '%s' raised: %s", scheduler, e)
+        return None, f"res4lyf_special_error: {e!r}"
 
     try:
         sigmas = comfy_samplers.calculate_sigmas(
@@ -430,18 +467,24 @@ def _register_routes():
                           f"not return a MODEL output."}, status=404)
 
         bs = _BASIC_SCHEDULER or _get_basic_scheduler()
-        if bs is None:
-            return web.json_response(
-                {"error": "BasicScheduler unavailable"}, status=500)
+        ms = patcher.get_model_object("model_sampling")
         try:
-            sigmas_tensor = bs.get_sigmas(
-                patcher, scheduler, steps, 1.0)[0].cpu()
+            # RES4LYF specials (beta57) aren't registered in
+            # SCHEDULER_HANDLERS, so BasicScheduler would raise.
+            special = _res4lyf_special_sigmas(scheduler, ms, steps)
+            if special is not None:
+                sigmas_tensor = special.cpu()
+            elif bs is None:
+                return web.json_response(
+                    {"error": "BasicScheduler unavailable"}, status=500)
+            else:
+                sigmas_tensor = bs.get_sigmas(
+                    patcher, scheduler, steps, 1.0)[0].cpu()
         except Exception as e:  # noqa: BLE001
             LOGGER.error("BasicScheduler call failed: %s", e, exc_info=True)
             return web.json_response(
                 {"error": f"BasicScheduler failed: {e!r}"}, status=500)
 
-        ms = patcher.get_model_object("model_sampling")
         sigma_min = float(ms.sigma_min)
         sigma_max = float(ms.sigma_max)
         _cache_real_sigmas(scheduler, steps, sigmas_tensor,
@@ -500,29 +543,40 @@ def _register_routes():
 
             patcher = _get_loaded_model_patcher()
             bs = _BASIC_SCHEDULER or _get_basic_scheduler()
-            if patcher is not None and bs is not None:
+            if patcher is not None:
                 try:
-                    sigmas_tensor = bs.get_sigmas(
-                        patcher, scheduler, int(steps), 1.0)[0].cpu()
                     ms = patcher.get_model_object("model_sampling")
-                    sigma_min_real = float(ms.sigma_min)
-                    sigma_max_real = float(ms.sigma_max)
-                    # Cache so the next request short-circuits to path #1
-                    # AND so the cache survives a ComfyUI restart on disk.
-                    _cache_real_sigmas(
-                        scheduler, int(steps),
-                        sigmas_tensor, sigma_min_real, sigma_max_real,
-                    )
-                    cached = _REAL_SIGMA_CACHE.get((scheduler, int(steps)))
-                    if cached is not None:
-                        return web.json_response({
-                            "values": cached["values"],
-                            "raw_sigmas": cached.get("raw_sigmas"),
-                            "trailing_zero": cached.get("trailing_zero", True),
-                            "dispatch": "real_model_live",
-                            "sigma_min": sigma_min_real,
-                            "sigma_max": sigma_max_real,
-                        })
+                    # RES4LYF specials (beta57) bypass BasicScheduler --
+                    # they aren't registered in SCHEDULER_HANDLERS, so
+                    # bs.get_sigmas would raise.
+                    special = _res4lyf_special_sigmas(scheduler, ms,
+                                                      int(steps))
+                    if special is not None:
+                        sigmas_tensor = special.cpu()
+                    elif bs is not None:
+                        sigmas_tensor = bs.get_sigmas(
+                            patcher, scheduler, int(steps), 1.0)[0].cpu()
+                    else:
+                        sigmas_tensor = None
+
+                    if sigmas_tensor is not None:
+                        sigma_min_real = float(ms.sigma_min)
+                        sigma_max_real = float(ms.sigma_max)
+                        _cache_real_sigmas(
+                            scheduler, int(steps),
+                            sigmas_tensor, sigma_min_real, sigma_max_real,
+                        )
+                        cached = _REAL_SIGMA_CACHE.get(
+                            (scheduler, int(steps)))
+                        if cached is not None:
+                            return web.json_response({
+                                "values": cached["values"],
+                                "raw_sigmas": cached.get("raw_sigmas"),
+                                "trailing_zero": cached.get("trailing_zero", True),
+                                "dispatch": "real_model_live",
+                                "sigma_min": sigma_min_real,
+                                "sigma_max": sigma_max_real,
+                            })
                 except Exception as e:  # noqa: BLE001
                     LOGGER.debug(
                         "BasicScheduler live preview failed for %s: %s",
@@ -838,14 +892,22 @@ class SigmaCurves:
         # Use the stock BasicScheduler node directly. It does the right
         # thing for every scheduler against any connected model and is
         # what the user expects "scheduler with model + denoise" to mean.
-        bs = _BASIC_SCHEDULER or _get_basic_scheduler()
-        if bs is None:
-            raise RuntimeError("BasicScheduler unavailable -- "
-                               "comfy_extras.nodes_custom_sampler not "
-                               "importable.")
-        base_used = bs.get_sigmas(model, scheduler, steps, denoise)[0].cpu()
-
+        # RES4LYF's `beta57` is the one exception -- it isn't registered
+        # in SCHEDULER_HANDLERS, so we mirror their special case
+        # (beta_scheduler with alpha=0.5, beta=0.7) ourselves.
         model_sampling = model.get_model_object("model_sampling")
+        special = _res4lyf_special_sigmas(scheduler, model_sampling,
+                                          steps, denoise)
+        if special is not None:
+            base_used = special.cpu()
+        else:
+            bs = _BASIC_SCHEDULER or _get_basic_scheduler()
+            if bs is None:
+                raise RuntimeError("BasicScheduler unavailable -- "
+                                   "comfy_extras.nodes_custom_sampler not "
+                                   "importable.")
+            base_used = bs.get_sigmas(model, scheduler, steps, denoise)[0].cpu()
+
         sigma_min_real = float(model_sampling.sigma_min)
         sigma_max_real = float(model_sampling.sigma_max)
 

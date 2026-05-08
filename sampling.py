@@ -53,7 +53,7 @@ hfe_auto adds a few scalar ops on top.
 
 import math
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -1828,28 +1828,28 @@ def _curve_cosine(xs: torch.Tensor, pivot: float, slope: float) -> torch.Tensor:
     return (1.0 + torch.cos(math.pi * t_warped)) / 2.0
 
 
-def _curve_beta(xs: torch.Tensor, pivot: float, slope: float) -> torch.Tensor:
-    """Beta / power-law S-curve (inherently asymmetric).
+def _curve_kumaraswamy(xs: torch.Tensor, pivot: float, slope: float) -> torch.Tensor:
+    """Kumaraswamy power-law S-curve (inherently asymmetric).
 
-    Uses the regularized incomplete beta function CDF.  *slope* controls
-    the concentration exponent (higher = stronger bend).  The *pivot*
-    sets the balance between head and tail weighting: pivot < n/2 biases
+    Uses the Kumaraswamy CDF as a closed-form approximation of the
+    regularized incomplete beta function.  *slope* controls the
+    concentration exponent (higher = stronger bend).  The *pivot* sets
+    the balance between head and tail weighting: pivot < n/2 biases
     toward early steps, pivot > n/2 biases toward late steps.
+
+    Note: this is NOT ComfyUI's BetaSchedulerNode (`scipy.stats.beta.ppf`
+    over the model's timestep table).  Different math, different shape.
     """
     n = xs.shape[0]
     if n <= 1:
         return torch.ones_like(xs)
     t = (xs - xs[0]) / (xs[-1] - xs[0])  # [0, 1]
-    # Derive alpha/beta from slope and pivot position
     pivot_norm = max(min(pivot / max(n - 1, 1), 0.95), 0.05)
-    concentration = max(slope * 5.0, 0.1)  # scale slope to useful range
-    alpha = concentration * (1.0 - pivot_norm)
-    beta_p = concentration * pivot_norm
-    # Beta CDF via element-wise power approximation (Kumaraswamy)
-    a = max(alpha, 0.01)
-    b = max(beta_p, 0.01)
+    concentration = max(slope * 5.0, 0.1)
+    a = max(concentration * (1.0 - pivot_norm), 0.01)
+    b = max(concentration * pivot_norm, 0.01)
     cdf = 1.0 - (1.0 - t.clamp(1e-7, 1.0 - 1e-7).pow(a)).pow(b)
-    return 1.0 - cdf  # decreasing
+    return 1.0 - cdf
 
 
 def _curve_laplacian(xs: torch.Tensor, pivot: float, slope: float) -> torch.Tensor:
@@ -2035,11 +2035,15 @@ def scheduler_cosine(model_sampling: Any, steps: int) -> torch.Tensor:
                              name='cosine')
 
 
-def scheduler_beta(model_sampling: Any, steps: int) -> torch.Tensor:
-    """Beta power-law S-curve (inherently asymmetric concentration)."""
-    return _tangent_schedule(model_sampling, steps, _curve_beta,
+def scheduler_kumaraswamy(model_sampling: Any, steps: int) -> torch.Tensor:
+    """Kumaraswamy power-law S-curve (inherently asymmetric concentration).
+
+    Distinct from ComfyUI's `beta` (BetaSchedulerNode) — see
+    `_curve_kumaraswamy` for the math.
+    """
+    return _tangent_schedule(model_sampling, steps, _curve_kumaraswamy,
                              slope_1=0.20, slope_2=0.20,
-                             name='beta')
+                             name='kumaraswamy')
 
 
 def scheduler_laplacian(model_sampling: Any, steps: int) -> torch.Tensor:
@@ -2119,7 +2123,7 @@ _SCHEDULERS = {
     # Alternative curves
     "logistic":             scheduler_logistic,
     "cosine":               scheduler_cosine,
-    "beta":                 scheduler_beta,
+    "kumaraswamy":          scheduler_kumaraswamy,
     "laplacian":            scheduler_laplacian,
     "linear":               scheduler_linear,
     # Asymmetric presets
@@ -2196,7 +2200,21 @@ def _unregister_old() -> None:
 def _register_samplers() -> None:
     kdiff = getattr(comfy_samplers, "k_diffusion_sampling", None)
 
+    registered: List[str] = []
+    skipped: List[str] = []
     for name, func in _SAMPLERS.items():
+        # Refuse to overwrite an existing sampler — even if the name is
+        # only present on kdiff (e.g. a built-in `sample_<name>`), bail
+        # so we don't shadow upstream behavior.
+        kdiff_attr = f"sample_{name}"
+        if kdiff is not None and hasattr(kdiff, kdiff_attr) \
+                and getattr(kdiff, kdiff_attr) is not func:
+            LOGGER.warning(
+                "RES4SHO: refusing to overwrite existing sampler '%s' "
+                "on k_diffusion_sampling.", name)
+            skipped.append(name)
+            continue
+
         ksampler_names = getattr(comfy_samplers, "KSAMPLER_NAMES", None)
         if isinstance(ksampler_names, (list, tuple)):
             kl = list(ksampler_names)
@@ -2219,16 +2237,30 @@ def _register_samplers() -> None:
                 KSampler.SAMPLERS = sl
 
         if kdiff is not None:
-            attr = f"sample_{name}"
-            setattr(kdiff, attr, func)
+            setattr(kdiff, kdiff_attr, func)
+        registered.append(name)
 
-    LOGGER.info("HFE samplers registered: %s", list(_SAMPLERS.keys()))
+    LOGGER.info("HFE samplers registered: %s", registered)
+    if skipped:
+        LOGGER.warning("HFE samplers skipped (name collision): %s", skipped)
 
 
 def _register_schedulers() -> None:
     handlers = getattr(comfy_samplers, "SCHEDULER_HANDLERS", None)
 
+    registered: List[str] = []
+    skipped: List[str] = []
     for name, func in _SCHEDULERS.items():
+        # Refuse to overwrite an existing handler — most importantly,
+        # ComfyUI's built-in `beta` (BetaSchedulerNode), which is a
+        # different math from anything we ship.
+        if isinstance(handlers, dict) and name in handlers:
+            LOGGER.warning(
+                "RES4SHO: refusing to overwrite existing scheduler "
+                "'%s' in SCHEDULER_HANDLERS.", name)
+            skipped.append(name)
+            continue
+
         if isinstance(handlers, dict) and len(handlers) > 0:
             any_handler = next(iter(handlers.values()))
             HandlerType = type(any_handler)
@@ -2249,8 +2281,12 @@ def _register_schedulers() -> None:
             if name not in sched_list:
                 sched_list.append(name)
                 KSampler.SCHEDULERS = sched_list
+        registered.append(name)
 
-    LOGGER.info("HFE schedulers registered: %s", list(_SCHEDULERS.keys()))
+    LOGGER.info("HFE schedulers registered: %s", registered)
+    if skipped:
+        LOGGER.warning(
+            "HFE schedulers skipped (name collision): %s", skipped)
 
 
 # =====================================================================

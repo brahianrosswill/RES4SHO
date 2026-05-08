@@ -15,8 +15,13 @@ import { api } from "../../scripts/api.js";
 // "custom" is the no-op option: picking any other curve immediately
 // reshapes the selected range (or the whole curve, if no range is set)
 // using that interpolation. Picking "custom" leaves edits alone.
+//
+// "bezier" is special -- instead of a closed-form interp from yA to yB
+// it draws two draggable handles inside the active range and produces
+// a cubic Bezier through them. The middle values fill in automatically
+// as the user drags, no separate "apply" needed.
 const INTERP_OPTIONS = [
-    "custom",
+    "custom", "bezier",
     "linear", "step", "step_next", "smoothstep", "smootherstep", "cosine",
     "sigmoid", "atan", "ease_in", "ease_out", "ease_in_out", "exp",
 ];
@@ -71,7 +76,7 @@ const SEG_FNS = {
 };
 
 function applyRangeCurve(values, a, b, interp, tension) {
-    if (!interp || interp === "custom") return;
+    if (!interp || interp === "custom" || interp === "bezier") return;
     if (a === b) return;
     if (a > b) { const t = a; a = b; b = t; }
     const yA = values[a], yB = values[b];
@@ -82,6 +87,75 @@ function applyRangeCurve(values, a, b, interp, tension) {
         const u = (i - a) / span;
         values[i] = clamp(fn(yA, yB, u, k), 0, 1);
     }
+}
+
+// ----- Cubic Bezier --------------------------------------------------
+// Handles are stored as { x, y } both normalized in [0, 1] within the
+// active range. Endpoints are the user's current values[a] / values[b],
+// so the curve always starts and ends at hand-edited positions; only
+// the middle is shaped by the handles.
+
+function _bezier1D(t, p0, p1, p2, p3) {
+    const u = 1 - t;
+    return u*u*u*p0 + 3*u*u*t*p1 + 3*u*t*t*p2 + t*t*t*p3;
+}
+
+// Cubic Bezier x(t) = u_target. Monotone in x as long as
+// 0 <= h0.x <= h1.x <= 1. Binary search is overkill but stable and
+// dirt cheap (24 iters ≈ 1e-7 precision).
+function _bezierTForX(u_target, p1x, p2x) {
+    let lo = 0, hi = 1;
+    for (let i = 0; i < 24; i++) {
+        const m = (lo + hi) * 0.5;
+        const x = _bezier1D(m, 0, p1x, p2x, 1);
+        if (x < u_target) lo = m;
+        else hi = m;
+    }
+    return (lo + hi) * 0.5;
+}
+
+function applyBezierRange(values, a, b, h0, h1) {
+    if (a === b) return;
+    if (a > b) { const t = a; a = b; b = t; }
+    const span = b - a;
+    if (span < 2) return;
+    const yA = values[a], yB = values[b];
+    const h0x = clamp(h0?.x ?? 1/3, 0, 1);
+    const h1x = clamp(h1?.x ?? 2/3, 0, 1);
+    const h0y = clamp(h0?.y ?? yA, 0, 1);
+    const h1y = clamp(h1?.y ?? yB, 0, 1);
+    for (let i = a + 1; i < b; i++) {
+        const u = (i - a) / span;
+        const t = _bezierTForX(u, h0x, h1x);
+        values[i] = clamp(_bezier1D(t, yA, h0y, h1y, yB), 0, 1);
+    }
+}
+
+// Pick handles that approximately reproduce the existing curve shape
+// across [a..b] when switching INTO bezier mode. Solves for h0.y, h1.y
+// such that B(1/3) ≈ values[i1] and B(2/3) ≈ values[i2] with handles
+// fixed at x=1/3 and x=2/3. Means flipping to bezier doesn't immediately
+// distort what the user has.
+function _fitBezierHandles(values, a, b) {
+    const span = b - a;
+    if (span < 2) return [{ x: 1/3, y: 0.66 }, { x: 2/3, y: 0.33 }];
+    const yA = values[a], yB = values[b];
+    const i1 = a + Math.max(1, Math.round(span / 3));
+    const i2 = a + Math.max(1, Math.round(2 * span / 3));
+    const y1 = values[i1] ?? (yA + (yB - yA) / 3);
+    const y2 = values[i2] ?? (yA + 2 * (yB - yA) / 3);
+    // B(1/3) = (8 yA + 12 h0y + 6 h1y + yB) / 27
+    // B(2/3) = (yA + 6 h0y + 12 h1y + 8 yB) / 27
+    const r1 = 27*y1 - 8*yA - yB;
+    const r2 = 27*y2 - yA - 8*yB;
+    // Solve: 12 h0y + 6 h1y = r1; 6 h0y + 12 h1y = r2
+    const det = 12*12 - 6*6;  // 108
+    const h0y = ( 12*r1 - 6*r2) / det;
+    const h1y = (-6*r1 + 12*r2) / det;
+    return [
+        { x: 1/3, y: clamp(h0y, 0, 1) },
+        { x: 2/3, y: clamp(h1y, 0, 1) },
+    ];
 }
 
 // ----- Themed dialogs -------------------------------------------------
@@ -532,9 +606,9 @@ const TOOLBAR_KEYS = ["curve", "tension", "apply", "all", "clear", "flat",
                       "reset", "save", "load", "del"];
 
 const TOOLBAR_TOOLTIPS = {
-    curve:   "curve type — interpolation across the active range",
-    tension: "curve tension (sigmoid / atan / ease / exp shape)",
-    apply:   "apply curve to range (or whole curve if no selection)",
+    curve:   "curve type — interp across active range; 'bezier' adds drag handles",
+    tension: "curve tension (sigmoid / atan / ease / exp); ignored by bezier",
+    apply:   "apply curve from range start→end; mid-points overwritten (use bezier to shape with handles)",
     all:     "select all steps as the active range",
     clear:   "clear range selection",
     flat:    "flatten range to its start value",
@@ -616,6 +690,16 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
         fromRealModel: false, // true when the displayed curve was sourced
                               // from a previous SigmaCurves.build() run
                               // against the user's actual model.
+        userEdited: false,   // set true when the user mutates values (drag,
+                             // apply, flatten, preset load, bezier handle).
+                             // Reset by refreshBaseline. Gates the
+                             // sigmas_updated websocket auto-refresh so a
+                             // workflow run cannot clobber hand edits.
+        // Bezier handle state (active only when interp === "bezier").
+        // x/y are normalized [0, 1] within the active range.
+        bezierH0: { x: 0.33, y: 0.66 },
+        bezierH1: { x: 0.67, y: 0.33 },
+        bezierDrag: null,    // "h0" | "h1" | null
     };
 
     function syncFromDataWidget() {
@@ -623,15 +707,39 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
         if (v === state.lastValueSeen) return;
         state.lastValueSeen = v;
         if (!v) return;
+        let restored = false;
         try {
             const obj = JSON.parse(v);
             if (Array.isArray(obj.values) && obj.values.length >= 2) {
                 state.values = obj.values.map(x => clamp(+x, 0, 1));
+                restored = true;
             }
             if (typeof obj.scheduler === "string") state.scheduler = obj.scheduler;
             if (typeof obj.steps === "number") state.steps = obj.steps | 0;
             if (typeof obj.interp === "string") state.interp = obj.interp;
             if (typeof obj.tension === "number") state.tension = obj.tension;
+            if (obj.bezierH0 && typeof obj.bezierH0.x === "number"
+                && typeof obj.bezierH0.y === "number") {
+                state.bezierH0 = {
+                    x: clamp(obj.bezierH0.x, 0, 1),
+                    y: clamp(obj.bezierH0.y, 0, 1),
+                };
+            }
+            if (obj.bezierH1 && typeof obj.bezierH1.x === "number"
+                && typeof obj.bezierH1.y === "number") {
+                state.bezierH1 = {
+                    x: clamp(obj.bezierH1.x, 0, 1),
+                    y: clamp(obj.bezierH1.y, 0, 1),
+                };
+            }
+            if (typeof obj.userEdited === "boolean") {
+                state.userEdited = obj.userEdited;
+            } else if (restored) {
+                // Curve_data restored from a workflow without an explicit
+                // userEdited flag (older saves). Treat as edited so the
+                // sigmas_updated auto-refresh doesn't clobber it.
+                state.userEdited = true;
+            }
         } catch (e) { /* keep what we have */ }
 
         // Reconcile with the live steps widget. ComfyUI's workflow
@@ -675,6 +783,15 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
             steps: state.steps,
             interp: state.interp,
             tension: state.tension,
+            bezierH0: {
+                x: +state.bezierH0.x.toFixed(6),
+                y: +state.bezierH0.y.toFixed(6),
+            },
+            bezierH1: {
+                x: +state.bezierH1.x.toFixed(6),
+                y: +state.bezierH1.y.toFixed(6),
+            },
+            userEdited: !!state.userEdited,
         };
         const json = JSON.stringify(obj);
         dataWidget.value = json;
@@ -698,7 +815,13 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
             hi = state.values.length - 1;
         }
         if (hi - lo < 2) return;
-        applyRangeCurve(state.values, lo, hi, state.interp, state.tension);
+        if (state.interp === "bezier") {
+            applyBezierRange(state.values, lo, hi,
+                              state.bezierH0, state.bezierH1);
+        } else {
+            applyRangeCurve(state.values, lo, hi, state.interp, state.tension);
+        }
+        state.userEdited = true;
         pushToDataWidget();
     }
 
@@ -708,10 +831,27 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
             new LiteGraph.ContextMenu(choices, {
                 event,
                 callback: (selected) => {
-                    if (typeof selected === "string") {
-                        state.interp = selected;
-                        pushToDataWidget();
+                    if (typeof selected !== "string") return;
+                    const wasBezier = state.interp === "bezier";
+                    state.interp = selected;
+                    // Switching INTO bezier mode: fit the handles to
+                    // the current curve shape so the visible curve
+                    // doesn't jump. Switching OUT: keep handles in
+                    // state so re-entering picks up where we left.
+                    if (selected === "bezier" && !wasBezier) {
+                        const lo = (state.selStart >= 0 && state.selEnd >= 0)
+                            ? Math.min(state.selStart, state.selEnd) : 0;
+                        const hi = (state.selStart >= 0 && state.selEnd >= 0)
+                            ? Math.max(state.selStart, state.selEnd)
+                            : (state.values?.length ?? 1) - 1;
+                        if (state.values && hi - lo >= 2) {
+                            const [h0, h1] = _fitBezierHandles(
+                                state.values, lo, hi);
+                            state.bezierH0 = h0;
+                            state.bezierH1 = h1;
+                        }
                     }
+                    pushToDataWidget();
                 },
             });
         } else {
@@ -771,6 +911,8 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
         state.fromRealModel = !!result.from_real_model;
         state.selStart = state.selEnd = -1;
         state.lastFetched = { scheduler: sch, steps: stp };
+        // Fresh baseline -- not user-edited until they touch it.
+        state.userEdited = false;
         pushToDataWidget();
     }
 
@@ -873,6 +1015,7 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
         const hi = Math.max(state.selStart, state.selEnd);
         const v = state.values[lo];
         for (let i = lo; i <= hi; i++) state.values[i] = v;
+        state.userEdited = true;
         pushToDataWidget();
     }
 
@@ -932,6 +1075,9 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
                     stepsWidget.value = p.steps;
                     state.steps = p.steps;
                 }
+                // Loaded preset is intentional user state; protect from
+                // the sigmas_updated auto-refresh.
+                state.userEdited = true;
                 pushToDataWidget();
                 showToast(`Loaded "${selected}".`, "success", 2000);
             },
@@ -972,7 +1118,10 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
     function handleToolbarClick(key, event) {
         switch (key) {
             case "curve":   showCurveDropdown(event); break;
-            case "tension": promptTension(); break;
+            case "tension":
+                if (state.interp === "bezier") return;
+                promptTension();
+                break;
             case "apply":   applyToSelection(); break;
             case "all":     selectAllRange(); break;
             case "clear":   clearRange(); break;
@@ -982,6 +1131,68 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
             case "load":    loadPresetUI(event); break;
             case "del":     deletePresetUI(event); break;
         }
+    }
+
+    // Returns [lo, hi] = the active bezier range. With a selection,
+    // it's the selection; without, it's the whole curve.
+    function _activeRange() {
+        if (!state.values) return [-1, -1];
+        if (state.selStart >= 0 && state.selEnd >= 0) {
+            return [
+                Math.min(state.selStart, state.selEnd),
+                Math.max(state.selStart, state.selEnd),
+            ];
+        }
+        return [0, state.values.length - 1];
+    }
+
+    // Convert bezier handle (range-normalized x ∈ [0,1], y ∈ [0,1]) to
+    // plot coordinates given the active range and rect.
+    function _handlePlotPos(rect, handle) {
+        if (!state.values) return [0, 0];
+        const [lo, hi] = _activeRange();
+        if (hi - lo < 2) return [0, 0];
+        const n = state.values.length;
+        const tA = lo / (n - 1);
+        const tB = hi / (n - 1);
+        const ht = tA + clamp(handle.x, 0, 1) * (tB - tA);
+        return dataToPlot(rect, ht, clamp(handle.y, 0, 1));
+    }
+
+    function _findBezierHandle(rect, px, py) {
+        if (state.interp !== "bezier" || !state.values) return null;
+        const [lo, hi] = _activeRange();
+        if (hi - lo < 2) return null;
+        for (const [key, h] of [["h0", state.bezierH0], ["h1", state.bezierH1]]) {
+            const [hx, hy] = _handlePlotPos(rect, h);
+            const dx = px - hx, dy = py - hy;
+            if (dx*dx + dy*dy <= (HIT_R + 2) * (HIT_R + 2)) return key;
+        }
+        return null;
+    }
+
+    function _setBezierHandleFromPlot(key, rect, px, py) {
+        const [lo, hi] = _activeRange();
+        if (hi - lo < 2) return;
+        const n = state.values.length;
+        const tA = lo / (n - 1), tB = hi / (n - 1);
+        if (tB <= tA) return;
+        const t = clamp((px - rect.x) / rect.w, tA, tB);
+        const xNorm = (t - tA) / (tB - tA);
+        const yVal = plotToValue(rect, py);
+        const h = key === "h0" ? state.bezierH0 : state.bezierH1;
+        h.x = clamp(xNorm, 0, 1);
+        h.y = clamp(yVal, 0, 1);
+        // Keep h0.x <= h1.x for a monotone-x Bezier (avoids loops).
+        if (state.bezierH0.x > state.bezierH1.x) {
+            const tmp = state.bezierH0.x;
+            state.bezierH0.x = state.bezierH1.x;
+            state.bezierH1.x = tmp;
+        }
+        applyBezierRange(state.values, lo, hi,
+                          state.bezierH0, state.bezierH1);
+        state.userEdited = true;
+        pushToDataWidget();
     }
 
     function findStep(rect, px, py) {
@@ -1106,6 +1317,45 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
                 ctx.stroke();
             }
 
+            // Bezier handles (only in bezier mode). Drawn after dots so
+            // the handles sit on top of regular step markers.
+            if (state.interp === "bezier") {
+                const [lo, hi] = _activeRange();
+                if (hi - lo >= 2) {
+                    const [aPx, aPy] = dataToPlot(rect, lo / (n - 1),
+                                                   state.values[lo]);
+                    const [bPx, bPy] = dataToPlot(rect, hi / (n - 1),
+                                                   state.values[hi]);
+                    const [h0x, h0y] = _handlePlotPos(rect, state.bezierH0);
+                    const [h1x, h1y] = _handlePlotPos(rect, state.bezierH1);
+                    // Stems from anchors to handles.
+                    ctx.strokeStyle = "rgba(255, 200, 0, 0.55)";
+                    ctx.setLineDash([3, 3]);
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(ox + aPx, oy + aPy);
+                    ctx.lineTo(ox + h0x, oy + h0y);
+                    ctx.moveTo(ox + bPx, oy + bPy);
+                    ctx.lineTo(ox + h1x, oy + h1y);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                    // Handle dots (square so they're distinct from steps).
+                    for (const [hx, hy, isDrag] of [
+                        [h0x, h0y, state.bezierDrag === "h0"],
+                        [h1x, h1y, state.bezierDrag === "h1"],
+                    ]) {
+                        const r = isDrag ? 6 : 5;
+                        ctx.fillStyle = "#fc0";
+                        ctx.fillRect(ox + hx - r, oy + hy - r, 2*r, 2*r);
+                        ctx.strokeStyle = "#000";
+                        ctx.lineWidth = 1.5;
+                        ctx.strokeRect(ox + hx - r + 0.5,
+                                       oy + hy - r + 0.5,
+                                       2*r - 1, 2*r - 1);
+                    }
+                }
+            }
+
             // Hover label (after dots so it sits on top)
             if (state.hover >= 0 && state.values[state.hover] !== undefined) {
                 const i = state.hover;
@@ -1167,10 +1417,12 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
             drawToolbarButton(ctx, tb.curve, ox, oy, `${state.interp} ▾`,
                 { active: state.interp !== "custom",
                   hover: state.toolbarHover === "curve" });
+            const bezierMode = state.interp === "bezier";
             drawToolbarButton(ctx, tb.tension, ox, oy,
-                `k ${state.tension.toFixed(2)}`,
-                { active: state.tension !== 0,
-                  hover: state.toolbarHover === "tension" });
+                bezierMode ? "k —" : `k ${state.tension.toFixed(2)}`,
+                { active: !bezierMode && state.tension !== 0,
+                  hover: !bezierMode && state.toolbarHover === "tension",
+                  disabled: bezierMode });
             drawToolbarButton(ctx, tb.apply, ox, oy, "apply",
                 { active: canApply,
                   hover: canApply && state.toolbarHover === "apply",
@@ -1272,6 +1524,15 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
                     return true;
                 }
 
+                // Bezier handle drag takes priority over step-dot drag.
+                if (state.interp === "bezier") {
+                    const handle = _findBezierHandle(rect, localX, localY);
+                    if (handle) {
+                        state.bezierDrag = handle;
+                        return true;
+                    }
+                }
+
                 // Plain left-click: drag the y of the nearest dot if it
                 // was clicked on; otherwise no-op (leaves the selection
                 // intact so the user can apply curves repeatedly).
@@ -1286,6 +1547,12 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
 
             if (evType === "pointermove" || evType === "mousemove") {
                 // Toolbar hover already updated above.
+                // Bezier handle drag.
+                if (state.bezierDrag) {
+                    _setBezierHandleFromPlot(state.bezierDrag, rect,
+                                             localX, localY);
+                    return true;
+                }
                 // Right-drag to extend the range.
                 if (state.rightDragging) {
                     state.selEnd = stepFromX(localX);
@@ -1296,6 +1563,7 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
                 // Left-drag to update the y of the held dot.
                 if (state.dragging >= 0) {
                     state.values[state.dragging] = plotToValue(rect, localY);
+                    state.userEdited = true;
                     pushToDataWidget();
                     return true;
                 }
@@ -1308,6 +1576,11 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
             }
 
             if (evType === "pointerup" || evType === "mouseup") {
+                if (state.bezierDrag) {
+                    state.bezierDrag = null;
+                    pushToDataWidget();
+                    return true;
+                }
                 if (state.rightDragging) {
                     state.rightDragging = false;
                     event.preventDefault?.();
@@ -1405,6 +1678,7 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
     setTimeout(ensureInitialized, 0);
     widget._sigmaInit = ensureInitialized;
     widget._sigmaSyncFromData = syncFromDataWidget;
+    widget._sigmaIsEdited = () => !!state.userEdited;
 
     watchWidgets();
     return widget;
@@ -1553,9 +1827,14 @@ if (typeof window !== "undefined" && !window.__res4sho_ws_listener) {
             if (!sw || !tw) continue;
             if (sch && sw.value !== sch) continue;
             if (stp != null && tw.value !== stp) continue;
-            // Trigger a refresh by clearing dataWidget value so the
-            // node's draw() sync re-fetches. Or call refreshBaseline
-            // via the wrapped scheduler callback.
+            // CRITICAL: skip nodes the user has hand-edited. The
+            // sigmas_updated event was meant to snap a *fresh* node to
+            // the real-model shape on first run -- never to clobber
+            // a hand-shaped schedule.
+            const cw = (n.widgets || []).find(
+                w => w?.type === "sigma_curve_steps");
+            if (cw && typeof cw._sigmaIsEdited === "function"
+                && cw._sigmaIsEdited()) continue;
             if (typeof sw.callback === "function") {
                 try { sw.callback(sw.value, app.canvas, n); } catch (e) {}
             }

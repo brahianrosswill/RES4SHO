@@ -36,8 +36,10 @@ If you're upgrading from an earlier version, note:
 - **`karras_tan` is removed.** Use `atan_focused` or `atan_steep` for similar
   shapes, or build a hybrid via the **Sigma Curves** node.
 - **Sigma Curves** and **Manual Sampler** are new — see their sections below.
-- New schedulers: `cosine`, `beta`, `laplacian`, `linear`, plus asymmetric
+- New schedulers: `cosine`, `kumaraswamy`, `laplacian`, `linear`, plus asymmetric
   `atan_structure` / `atan_detail` / `logistic_structure` / `logistic_detail`.
+  (ComfyUI's built-in `beta` is left alone — the Kumaraswamy curve we ship
+  is closed-form and a different shape, so it lives under its own name.)
 
 Old names are explicitly unregistered on load, so saved workflows that
 reference them will need to be repointed at the current equivalents.
@@ -114,7 +116,7 @@ on first use.
 |-----------|-----------|
 | `logistic` | sigmoid S-curve, sharper transition than `atan` |
 | `cosine` | smoothest, no inflection |
-| `beta` | beta-distribution-shaped, asymmetric tails |
+| `kumaraswamy` | closed-form beta-like CDF, asymmetric tails (distinct from ComfyUI's `beta`) |
 | `laplacian` | exponential decay through mid sigmas |
 | `linear` | reference baseline |
 
@@ -301,7 +303,7 @@ update step. The 10 modes span 5 domains:
 
 **Schedulers.** `atan_*` and `logistic_*` apply a curve function in two
 stages (σ_max → σ_mid for structure, σ_mid → σ_min for detail), each with
-its own slope normalized by step count. `cosine` / `beta` / `laplacian` /
+its own slope normalized by step count. `cosine` / `kumaraswamy` / `laplacian` /
 `linear` apply a single curve across the whole range. The `_structure` /
 `_detail` variants make the two stages asymmetric.
 
